@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Release, Debug]
+        python-version: ['3.12']
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependency packages (with C++ atomics extensions)
+      run: |
+        pip install "git+https://github.com/SlickQuant/slick-queue-py.git"
+        pip install "git+https://github.com/SlickQuant/slick-stream-buffer-py.git"
+
+    - name: Install package
+      run: |
+        pip install -e .
+        python -c "import slick_stream_buffer_multiplexer_py as m; print('version:', m.__version__)"
+
+    - name: Get Python executable path
+      id: python-path
+      run: python -c "import sys; print(f'path={sys.executable}')" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DPython3_EXECUTABLE="${{ steps.python-path.outputs.path }}"
+
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build_type }}
+
+    - name: Run Tests
+      working-directory: build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure --verbose

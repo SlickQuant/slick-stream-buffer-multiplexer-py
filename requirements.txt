@@ -1,0 +1,3 @@
+# Runtime dependencies (binary-compatible Python ports of the C++ dependencies)
+slick-queue-py>=1.2.0
+slick-stream-buffer-py>=0.1.0
