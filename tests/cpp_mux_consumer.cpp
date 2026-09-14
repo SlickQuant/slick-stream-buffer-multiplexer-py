@@ -4,13 +4,17 @@
 // Usage:
 //   cpp_mux_consumer <queue_name> <num_messages>
 //                    --producer <id> <shm_name> [--producer <id> <shm_name> ...]
-//                    [--timeout-s N]
+//                    [--timeout-s N] [--no-read-last]
 //
 // Opens the shared record queue and the listed producer segments, then reads
 // num_messages messages in global order. Every message's framing must be
 // valid (worker_id == producer_id) and every producer's msg_num sequence must
 // be strictly sequential from 0. Records referencing unregistered producer
 // ids are skipped by the multiplexer itself.
+//
+//   --no-read-last   attach with interop_no_read_last_traits instead of the
+//                    default traits; the queue must have been created the same
+//                    way, or construction throws a feature mismatch
 //
 // Prints "CONSUMED <n>" on success and exits 0.
 //
@@ -24,46 +28,31 @@
 #include <map>
 #include <thread>
 
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::fprintf(stderr,
-            "Usage: %s <queue_name> <num_messages> --producer <id> <shm_name> "
-            "[--producer <id> <shm_name> ...] [--timeout-s N]\n", argv[0]);
-        return 2;
-    }
+namespace {
 
-    const char* queue_name = argv[1];
-    const int num_messages = std::atoi(argv[2]);
+struct options {
+    const char* queue_name = nullptr;
+    int num_messages = 0;
     int timeout_s = 30;
-
     std::map<uint32_t, const char*> producer_names;
-    for (int i = 3; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--producer") == 0 && i + 2 < argc) {
-            producer_names[static_cast<uint32_t>(std::atoi(argv[i + 1]))] = argv[i + 2];
-            i += 2;
-        } else if (std::strcmp(argv[i], "--timeout-s") == 0 && i + 1 < argc) {
-            timeout_s = std::atoi(argv[i + 1]);
-            ++i;
-        } else {
-            std::fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            return 2;
-        }
-    }
+};
 
+template<typename Traits>
+int consume(const options& opt) {
     try {
-        slick::stream_buffer_multiplexer mux(queue_name);
-        for (const auto& [id, name] : producer_names) {
+        slick::basic_stream_buffer_multiplexer<Traits> mux(opt.queue_name);
+        for (const auto& [id, name] : opt.producer_names) {
             mux.add_producer(id, name);
         }
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(opt.timeout_s);
         std::map<uint32_t, uint32_t> expected;  // per-producer next msg_num
 
         uint64_t cursor = 0;
         int received = 0;
-        while (received < num_messages) {
+        while (received < opt.num_messages) {
             if (std::chrono::steady_clock::now() >= deadline) {
-                std::fprintf(stderr, "timed out after %d of %d messages\n", received, num_messages);
+                std::fprintf(stderr, "timed out after %d of %d messages\n", received, opt.num_messages);
                 return 1;
             }
             auto rec = mux.read(cursor);
@@ -98,4 +87,38 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cpp_mux_consumer error: %s\n", e.what());
         return 1;
     }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::fprintf(stderr,
+            "Usage: %s <queue_name> <num_messages> --producer <id> <shm_name> "
+            "[--producer <id> <shm_name> ...] [--timeout-s N] [--no-read-last]\n", argv[0]);
+        return 2;
+    }
+
+    options opt;
+    opt.queue_name = argv[1];
+    opt.num_messages = std::atoi(argv[2]);
+    bool no_read_last = false;
+
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--producer") == 0 && i + 2 < argc) {
+            opt.producer_names[static_cast<uint32_t>(std::atoi(argv[i + 1]))] = argv[i + 2];
+            i += 2;
+        } else if (std::strcmp(argv[i], "--timeout-s") == 0 && i + 1 < argc) {
+            opt.timeout_s = std::atoi(argv[i + 1]);
+            ++i;
+        } else if (std::strcmp(argv[i], "--no-read-last") == 0) {
+            no_read_last = true;
+        } else {
+            std::fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            return 2;
+        }
+    }
+
+    return no_read_last ? consume<interop_no_read_last_traits>(opt)
+                        : consume<slick::default_queue_traits>(opt);
 }

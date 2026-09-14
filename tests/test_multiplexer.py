@@ -18,6 +18,8 @@ from slick_stream_buffer_multiplexer_py import (
     ProducerBuffer,
     MultiplexRecord,
     AtomicCursor,
+    QueueTraits,
+    default_queue_traits,
 )
 from slick_stream_buffer_py import SlickStreamBuffer
 
@@ -150,6 +152,40 @@ def test_duplicate_producer_id_raises():
     mux.close()
 
 
+def test_producer_id_out_of_uint32_range_raises():
+    """Regression: an id that does not fit the record's uint32 field used to be
+    accepted, then made consume() raise struct.error AFTER the inner stream
+    buffer had published - leaving a record no multiplexer reader could find.
+    It must be rejected up front, without registering anything."""
+    mux = StreamBufferMultiplexer(shared_queue_size=64)
+    for bad in (-1, 0xFFFFFFFF + 1, 1 << 64):
+        try:
+            mux.add_producer(bad, capacity=1024, control_size=16)
+            assert False, f"expected ValueError for producer_id={bad}"
+        except ValueError as e:
+            assert "out of range" in str(e)
+        assert not mux.has_producer(bad)
+    for bad in (1.0, "1", None):
+        try:
+            mux.add_producer(bad, capacity=1024, control_size=16)
+            assert False, f"expected TypeError for producer_id={bad!r}"
+        except TypeError:
+            pass
+    assert mux.producer_count() == 0
+
+    # both ends of the range are accepted and survive the round trip
+    p_lo = mux.add_producer(0, capacity=1024, control_size=16)
+    p_hi = mux.add_producer(0xFFFFFFFF, capacity=1024, control_size=16)
+    publish_message(p_lo, b"lo")
+    publish_message(p_hi, b"hi")
+
+    rec, cursor = mux.read(0)
+    assert rec.data == b"lo" and rec.producer_id == 0
+    rec, cursor = mux.read(cursor)
+    assert rec.data == b"hi" and rec.producer_id == 0xFFFFFFFF
+    mux.close()
+
+
 def test_invalid_sizes_raise():
     for size in (0, 100):  # shared queue size not pow2
         try:
@@ -209,6 +245,86 @@ def test_stream_buffer_accessor():
     mux.close()
 
 
+def test_traits_accessor():
+    """The multiplexer is configured by the shared queue's traits, and exposes
+    the queue's own frozen snapshot rather than a second copy - the two terms
+    loss_count() sums must never be able to disagree."""
+    mux = StreamBufferMultiplexer(shared_queue_size=64)
+    assert mux.traits is mux.shared_queue.traits
+    assert mux.traits.enable_loss_detection == default_queue_traits.enable_loss_detection
+    mux.close()
+
+    class Silent(QueueTraits):
+        enable_loss_detection = False
+
+    quiet = StreamBufferMultiplexer(shared_queue_size=64, traits=Silent)
+    assert quiet.traits.enable_loss_detection is False
+    assert quiet.shared_queue.traits.enable_loss_detection is False
+    quiet.close()
+
+    # a malformed traits type is rejected at construction, as slick-queue-py does
+    class Bogus(QueueTraits):
+        enable_loss_detection = "yes"
+
+    try:
+        StreamBufferMultiplexer(shared_queue_size=64, traits=Bogus)
+        assert False, "expected a malformed traits type to be rejected"
+    except TypeError:
+        pass
+
+
+def test_get_producer_buffers():
+    mux = StreamBufferMultiplexer(shared_queue_size=64)
+    p0 = mux.add_producer(0, capacity=1024, control_size=16)
+    p7 = mux.add_producer(7, capacity=1024, control_size=16)
+
+    table = mux.get_producer_buffers()
+    assert set(table) == {0, 7}
+    assert table[0] is p0
+    assert table[7] is p7
+    assert mux.producer_count() == 2
+
+    # zero-copy: a live view of the multiplexer's own table, so a later
+    # registration shows up, and the same cached view comes back every call
+    mux.add_producer(3, capacity=1024, control_size=16)
+    assert set(table) == {0, 3, 7}
+    assert mux.get_producer_buffers() is table
+
+    total = sum(p.loss_count() for p in table.values())
+    assert total == 0
+
+    # Regression: the view used to be the mutable dict itself, so .clear()
+    # silently unregistered every producer and read() skipped their records.
+    for mutate in (lambda: table.clear(),
+                   lambda: table.pop(0),
+                   lambda: table.update({9: p0}),
+                   lambda: table.__setitem__(9, p0),
+                   lambda: table.__delitem__(0)):
+        try:
+            mutate()
+            assert False, "expected the producer table to be read-only"
+        except (TypeError, AttributeError):
+            pass
+    assert set(table) == {0, 3, 7}
+
+    publish_message(p7, b"still routed")
+    rec, _ = mux.read(0)
+    assert rec.data == b"still routed" and rec.producer_id == 7
+
+    # close() keeps the table - unlink() after close() still needs every
+    # producer's segment - and the cached view is unchanged
+    mux.close()
+    assert set(table) == {0, 3, 7}
+    assert mux.get_producer_buffers() is table
+
+
+def test_remove_missing_segment_is_harmless():
+    """remove() reports nothing was removed on POSIX, and is the documented
+    no-op returning True on Windows."""
+    assert StreamBufferMultiplexer.remove("sbm_py_never_existed_xyz") is (
+        sys.platform == 'win32')
+
+
 def run_all_tests():
     tests = [
         ("EmptyMultiplexerReadReturnsFalsy", test_empty_multiplexer_read_returns_falsy),
@@ -217,9 +333,13 @@ def run_all_tests():
         ("ConsumeZeroPublishesNothing", test_consume_zero_publishes_nothing),
         ("UnregisteredProducerQueries", test_unregistered_producer_queries),
         ("DuplicateProducerIdRaises", test_duplicate_producer_id_raises),
+        ("ProducerIdOutOfUint32RangeRaises", test_producer_id_out_of_uint32_range_raises),
         ("InvalidSizesRaise", test_invalid_sizes_raise),
         ("ProducerBufferForwardedApi", test_producer_buffer_forwarded_api),
         ("StreamBufferAccessor", test_stream_buffer_accessor),
+        ("TraitsAccessor", test_traits_accessor),
+        ("GetProducerBuffers", test_get_producer_buffers),
+        ("RemoveMissingSegmentIsHarmless", test_remove_missing_segment_is_harmless),
     ]
 
     print("=" * 70)

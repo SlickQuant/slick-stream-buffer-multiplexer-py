@@ -1,5 +1,53 @@
 # Changelogs
 
+## [v2.0.0] - 2026-09-13
+
+Tracks C++ [slick-stream-buffer-multiplexer v2.0.0](https://github.com/SlickQuant/slick-stream-buffer-multiplexer/blob/main/CHANGELOG.md)
+and moves to the version number shared with the C++ header and the sibling ports (0.1.0 -> 2.0.0).
+The shared-memory formats are unchanged, so segments written by v0.1.0 (or a C++ v1.x process)
+are still readable with the default traits.
+
+### Breaking
+- Requires **slick-queue-py >= 2.0.0** and **slick-stream-buffer-py >= 2.0.0**.
+- `ProducerBuffer.loss_count()` stays at 0 under multiplexer traffic. Records are dereferenced
+  without the inner ring's scan-loss counter, which for a jump-read would count the same lap
+  again on every later record; the multiplexer counts one loss per lapped record in
+  `mux.loss_count()` instead. The inner counter only moves for reads made through
+  `producer.stream_buffer.read(cursor, traits)` with counting traits.
+- `close()` keeps the registration table, so `has_producer()` and `producer_count()` still
+  report closed producers - `unlink()` after `close()` needs them (see Fixed).
+
+### Added
+- `traits` constructor argument: slick-queue-py's `QueueTraits`, passed straight through to the
+  shared record queue and readable back as `mux.traits`; `QueueTraits` and
+  `default_queue_traits` are re-exported. `enable_loss_detection` (default on, as v0.1.0 always
+  counted) switches both terms of `loss_count()` together. `enable_read_last` is recorded in the
+  queue's header (`'SLQ1'` on, `'SLQ0'` off) and must match on every Python and C++ peer, or
+  attaching fails with "Shared memory feature mismatch".
+- `StreamBufferMultiplexer.remove(name)`: unlink a queue or producer segment by name, to recover
+  from a run that died mid-initialization. `tests/cleanup_shm.py` uses it.
+- `get_producer_buffers()`: a read-only live view of the registration table, keyed by
+  `producer_id`.
+- Tests: traits accessor and validation, loss counting disabled by traits, scan loss vs
+  multiplexer loss, `producer_id` range, `get_producer_buffers()`, `remove()`, `unlink()` after
+  `close()`, and C++/Python interop with `enable_read_last = False` whichever language creates the
+  queue (`cpp_mux_producer` / `cpp_mux_consumer --no-read-last`).
+
+### Fixed
+- `add_producer()` validates `producer_id` against the record's `uint32` field (`TypeError` for a
+  non-integer, `ValueError` out of range) before creating any segment. An out-of-range id made
+  `consume()` raise `struct.error` after the producer's ring had already published.
+- `unlink()` after `close()` - the documented order - leaked every segment on POSIX, because
+  `close()` emptied the registration table and dropped the queue's `SharedMemory` handle. Both are
+  kept now, and repeating `unlink()` is a no-op.
+- `loss_count()` documentation: only the multiplexer-level term is filtered by producer
+  registration. Shared-queue wrap loss can include producers this instance never registered, so
+  the total is an upper bound.
+
+### Changed
+- The interop tests build against C++ slick-stream-buffer-multiplexer `v2.0.0` (was `main`) and
+  require CMake 3.21.
+
 ## [v0.1.0] - 2026-07-09
 
 ### Added

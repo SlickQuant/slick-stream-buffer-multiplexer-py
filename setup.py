@@ -52,8 +52,8 @@ setup(
     keywords='stream-buffer, multiplexer, lock-free, atomic, shared-memory, ipc, multiprocessing, mpmc',
     py_modules=['slick_stream_buffer_multiplexer_py'],
     install_requires=[
-        'slick-queue-py>=1.2.0',
-        'slick-stream-buffer-py>=0.1.0',
+        'slick-queue-py>=2.0.0',
+        'slick-stream-buffer-py>=2.0.0',
     ],
     python_requires='>=3.8',
     license='MIT',

@@ -25,7 +25,7 @@ sys.path.insert(0, str(_root))
 sys.path.insert(0, str(_root.parent / "slick-queue-py"))
 sys.path.insert(0, str(_root.parent / "slick-stream-buffer-py"))
 
-from slick_stream_buffer_multiplexer_py import StreamBufferMultiplexer, ProducerBuffer
+from slick_stream_buffer_multiplexer_py import StreamBufferMultiplexer, ProducerBuffer, QueueTraits
 
 
 # ---------------------------------------------------------------------------
@@ -275,11 +275,116 @@ def test_partial_registration_interop():
         mux.close()
 
 
+class NoReadLast(QueueTraits):
+    """enable_read_last is the one trait that reaches shared memory: the queue's
+    creator writes 'SLQ0' instead of 'SLQ1' and every peer must agree. C++ twin:
+    interop_no_read_last_traits in interop_common.hpp (--no-read-last)."""
+    enable_read_last = False
+
+
+def _ready(proc: subprocess.Popen) -> None:
+    """Wait for a C++ producer's READY line, surfacing its error if it died."""
+    line = proc.stdout.readline()
+    assert "READY" in line, \
+        f"unexpected producer output: {line!r} {'' if line else proc.stderr.read()}"
+
+
+def test_read_last_off_python_queue():
+    """Python creates the queue with enable_read_last=False ('SLQ0'). A C++
+    consumer with the default traits is rejected at attach time; a C++ producer
+    and consumer built with matching traits interoperate with Python."""
+    print("TEST: enable_read_last=False queue created by Python")
+    n = 50  # per producer
+    mux = StreamBufferMultiplexer(shared_queue_size=1024, name="mux_io_nrlp_records",
+                                  traits=NoReadLast)
+    cpp_producer = None
+    try:
+        p0 = mux.add_producer(0, capacity=1 << 16, control_size=256, name="mux_io_nrlp_p0")
+
+        result = subprocess.run(
+            [find_cpp_executable("cpp_mux_consumer"), mux.get_shm_name(), "1",
+             "--producer", "0", p0.get_shm_name()],
+            capture_output=True, text=True, timeout=60)
+        assert result.returncode != 0, "default-traits C++ consumer attached to an 'SLQ0' queue"
+        assert "Shared memory feature mismatch" in result.stderr, result.stderr
+        print("  default-traits C++ consumer rejected: feature mismatch")
+
+        cpp_producer = subprocess.Popen(
+            [find_cpp_executable("cpp_mux_producer"), mux.get_shm_name(), "mux_io_nrlp_p1",
+             "1", str(n), "create-producer", str(1 << 16), "256", "--hold", "--no-read-last"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _ready(cpp_producer)
+        mux.add_producer(1, name="mux_io_nrlp_p1")
+
+        for i in range(n):
+            publish_msg(p0, i)
+
+        python_read_all(mux, {0: n, 1: n})
+        print(f"  Python consumer saw all {2 * n} messages from both languages")
+
+        result = subprocess.run(
+            [find_cpp_executable("cpp_mux_consumer"), mux.get_shm_name(), str(2 * n),
+             "--producer", "0", p0.get_shm_name(), "--producer", "1", "mux_io_nrlp_p1",
+             "--no-read-last"],
+            capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, f"cpp_mux_consumer failed: {result.stderr}"
+        assert f"CONSUMED {2 * n}" in result.stdout
+        print(f"  matching C++ consumer saw all {2 * n} messages from both languages")
+
+        line = cpp_producer.stdout.readline()
+        assert f"PUBLISHED {n}" in line, f"unexpected producer output: {line!r}"
+    finally:
+        if cpp_producer is not None:
+            _finish(cpp_producer)
+        mux.close()
+        mux.unlink()
+
+
+def test_read_last_off_cpp_queue():
+    """C++ creates the queue with enable_read_last=False ('SLQ0') and publishes.
+    A Python opener with the default traits is rejected; one with matching
+    traits consumes every message."""
+    print("TEST: enable_read_last=False queue created by C++")
+    n = 50
+    queue_name, producer_name = "mux_io_nrlc_records", "mux_io_nrlc_p0"
+    cpp_producer = subprocess.Popen(
+        [find_cpp_executable("cpp_mux_producer"), queue_name, producer_name, "0", str(n),
+         "create-queue", "1024", "create-producer", str(1 << 16), "256",
+         "--hold", "--no-read-last"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    mux = None
+    try:
+        _ready(cpp_producer)
+
+        try:
+            StreamBufferMultiplexer(name=queue_name)
+            assert False, "default-traits Python opener attached to an 'SLQ0' queue"
+        except RuntimeError as e:
+            assert "Shared memory feature mismatch" in str(e), str(e)
+        print("  default-traits Python opener rejected: feature mismatch")
+
+        mux = StreamBufferMultiplexer(name=queue_name, traits=NoReadLast)
+        assert not mux.traits.enable_read_last
+        mux.add_producer(0, name=producer_name)
+        python_read_all(mux, {0: n})
+        print(f"  matching Python consumer saw all {n} messages from the C++ producer")
+
+        line = cpp_producer.stdout.readline()
+        assert f"PUBLISHED {n}" in line, f"unexpected producer output: {line!r}"
+    finally:
+        _finish(cpp_producer)
+        if mux is not None:
+            mux.close()
+            mux.unlink()
+
+
 ALL_TESTS = {
     "python_producers_cpp_consumer": test_python_producers_cpp_consumer,
     "cpp_producers_python_consumer": test_cpp_producers_python_consumer,
     "mixed_language_producers": test_mixed_language_producers,
     "partial_registration_interop": test_partial_registration_interop,
+    "read_last_off_python_queue": test_read_last_off_python_queue,
+    "read_last_off_cpp_queue": test_read_last_off_cpp_queue,
 }
 
 

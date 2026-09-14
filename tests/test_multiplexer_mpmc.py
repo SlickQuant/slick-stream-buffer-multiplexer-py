@@ -18,7 +18,13 @@ sys.path.insert(0, str(_root.parent / "slick-stream-buffer-py"))
 from slick_stream_buffer_multiplexer_py import (
     StreamBufferMultiplexer,
     AtomicCursor,
+    QueueTraits,
 )
+
+
+class SilentTraits(QueueTraits):
+    """Both loss terms off - records are still skipped, only the counters go quiet."""
+    enable_loss_detection = False
 
 PAYLOAD_FMT = "<IQ"  # producer_id u32, seq u64
 PAYLOAD_SIZE = struct.calcsize(PAYLOAD_FMT)
@@ -194,7 +200,77 @@ def test_producer_ring_lap_causes_multiplexer_loss():
 
     # only the last 4 published records (6..9) survive in the producer's control ring
     assert values == [6, 7, 8, 9], f"got {values}"
-    assert mux.loss_count() == 6  # Python always counts (C++ debug-build behavior)
+    assert mux.loss_count() == 6
+    # The multiplexer dereferences through traits that do not count, so the
+    # producer's own inner-ring counter must stay untouched: it is reserved for
+    # reads the caller makes directly through stream_buffer.read().
+    assert p0.loss_count() == 0, \
+        f"dereference must not move the producer's loss counter, got {p0.loss_count()}"
+    mux.close()
+
+
+def test_traits_disable_loss_counting():
+    """enable_loss_detection switches BOTH terms of loss_count() together. Records
+    are skipped exactly as before; only the counters are silent."""
+    mux = StreamBufferMultiplexer(shared_queue_size=64, traits=SilentTraits)
+    assert mux.traits.enable_loss_detection is False
+    p0 = mux.add_producer(0, capacity=1024, control_size=4)  # laps after 4 records
+
+    for i in range(10):
+        mv = p0.prepare(1)
+        mv[:] = bytes([i])
+        p0.commit(1)
+        p0.consume(1)
+
+    cursor = 0
+    values = []
+    while True:
+        rec, cursor = mux.read(cursor)
+        if not rec:
+            break
+        values.append(rec.data[0])
+
+    assert values == [6, 7, 8, 9], f"got {values}"
+    assert mux.loss_count() == 0, "silent traits must not accumulate loss_count()"
+    assert p0.loss_count() == 0
+    mux.close()
+
+
+def test_scan_loss_counter_is_a_different_number_from_multiplexer_loss():
+    """Why the dereference does not use count_loss.
+
+    read()'s counter answers "how far has the producer run past this cursor?",
+    which for a sequential scan is the number of records skipped. The
+    multiplexer counts one loss per lapped record instead. On the same run the
+    two are legitimately different numbers - here 8 against 6 - and the scan
+    figure is the wrong one for a jump-read, because every later lapped
+    dereference would add its own copy of that same distance all over again.
+    """
+    from slick_stream_buffer_py import counting_read_traits
+
+    mux = StreamBufferMultiplexer(shared_queue_size=64)
+    p0 = mux.add_producer(0, capacity=1024, control_size=4)
+
+    for i in range(10):
+        mv = p0.prepare(1)
+        mv[:] = bytes([i])
+        p0.commit(1)
+        p0.consume(1)
+
+    # The multiplexer's own reads leave the producer's counter alone.
+    cursor = 0
+    while True:
+        rec, cursor = mux.read(cursor)
+        if not rec:
+            break
+    assert mux.loss_count() == 6, "one count per lapped record"
+    assert p0.loss_count() == 0, "the dereference never touches this counter"
+
+    # A caller who reads that ring directly with counting traits gets the scan
+    # figure: slot 0 now holds seq 8, so a cursor at 0 jumps 8 sequences.
+    data, _, _ = p0.stream_buffer.read(0, counting_read_traits)
+    assert data is not None
+    assert p0.loss_count() == 8,         f"the scan counter measures cursor distance, not lapped records: {p0.loss_count()}"
     mux.close()
 
 
@@ -204,6 +280,9 @@ def run_all_tests():
         ("WorkStealingSharedCursor", test_work_stealing_shared_cursor),
         ("SharedQueueWrapCausesLoss", test_shared_queue_wrap_causes_loss),
         ("ProducerRingLapCausesMultiplexerLoss", test_producer_ring_lap_causes_multiplexer_loss),
+        ("TraitsDisableLossCounting", test_traits_disable_loss_counting),
+        ("ScanLossCounterIsADifferentNumberFromMultiplexerLoss",
+         test_scan_loss_counter_is_a_different_number_from_multiplexer_loss),
     ]
 
     print("=" * 70)

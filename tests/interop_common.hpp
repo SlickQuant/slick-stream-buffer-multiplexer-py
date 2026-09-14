@@ -8,9 +8,19 @@
 //   total length = 8 + (msg_num * 7) % 57      (varies 8..64 bytes)
 //   payload fill = (msg_num * 31 + 7) & 0xFF
 //
+#include <slick/queue.hpp>
+
 #include <cstdint>
 #include <cstring>
 #include <cstddef>
+
+// Non-default traits for the shared record queue. enable_read_last is the one
+// trait that reaches shared memory: the creator writes 'SLQ0' instead of 'SLQ1'
+// into the layout marker and every attacher, in either language, must be built
+// the same way. Python's twin is NoReadLast in tests/test_interop.py.
+struct interop_no_read_last_traits : slick::default_queue_traits {
+    static constexpr bool enable_read_last = false;
+};
 
 inline std::size_t interop_msg_length(uint32_t msg_num) {
     return 8 + (msg_num * 7) % 57;

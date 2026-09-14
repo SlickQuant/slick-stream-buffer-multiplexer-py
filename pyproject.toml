@@ -30,8 +30,8 @@ classifiers = [
     "Operating System :: MacOS",
 ]
 dependencies = [
-    "slick-queue-py>=1.2.0",
-    "slick-stream-buffer-py>=0.1.0",
+    "slick-queue-py>=2.0.0",
+    "slick-stream-buffer-py>=2.0.0",
 ]
 
 [project.urls]

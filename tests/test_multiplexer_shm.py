@@ -30,17 +30,6 @@ def publish_message(pb: ProducerBuffer, data: bytes) -> None:
     pb.consume(len(data))
 
 
-def _cleanup(*muxes):
-    for m in muxes:
-        try:
-            m.close()
-        except Exception:
-            pass
-    # unlink via the creator (first argument)
-    # note: close() clears the producer map, so unlink the raw segments instead
-    # by re-listing names is unnecessary here - tests unlink before close below
-
-
 def test_shm_roundtrip():
     creator = StreamBufferMultiplexer(shared_queue_size=64, name="mux_py_rt_records")
     c0 = creator.add_producer(0, capacity=1024, control_size=16, name="mux_py_rt_p0")
@@ -251,6 +240,52 @@ def test_shm_cross_process_roundtrip():
         creator.close()
 
 
+def test_shm_unlink_after_close():
+    """The documented lifecycle - close every handle, then unlink once - deletes
+    every segment. close() used to empty the registration table, and
+    SlickQueue.close() drops the handle SlickQueue.unlink() needs, so unlink()
+    after close() reached nothing: on POSIX the queue and producer segments all
+    outlived the run and were attached, stale, by the next one."""
+    q, p0, p1 = "mux_py_uac_records", "mux_py_uac_p0", "mux_py_uac_p1"
+    creator = StreamBufferMultiplexer(shared_queue_size=64, name=q)
+    creator.add_producer(0, capacity=1024, control_size=16, name=p0)
+    creator.add_producer(1, capacity=1024, control_size=16, name=p1)
+    opener = StreamBufferMultiplexer(name=q)
+    opener.add_producer(0, name=p0)
+    opener.add_producer(1, name=p1)
+
+    opener.close()
+    creator.close()
+    creator.unlink()
+
+    successor = None
+    try:
+        if sys.platform != 'win32':
+            # remove() only succeeds on a name still there (and clears it, so a
+            # failure here leaves nothing behind for the next run)
+            leaked = [n for n in (q, p0, p1) if StreamBufferMultiplexer.remove(n)]
+            assert not leaked, f"segments outlived close() + unlink(): {leaked}"
+
+        # the next run's creators, with new geometry: a stale segment would be
+        # attached instead and fail the geometry check
+        successor = StreamBufferMultiplexer(shared_queue_size=128, name=q)
+        successor.add_producer(0, capacity=2048, control_size=32, name=p0)
+
+        # unlink once: repeating it must not delete the successor's segments
+        creator.unlink()
+        probe = StreamBufferMultiplexer(name=q)
+        try:
+            probe.add_producer(0, name=p0)
+            assert probe.shared_queue.size == 128
+            assert probe.get_producer_buffer(0).capacity == 2048
+        finally:
+            probe.close()
+    finally:
+        if successor is not None:
+            successor.close()
+            successor.unlink()
+
+
 def run_all_tests():
     tests = [
         ("ShmRoundtrip", test_shm_roundtrip),
@@ -259,6 +294,7 @@ def run_all_tests():
         ("ShmGeometryMismatchRaises", test_shm_geometry_mismatch_raises),
         ("ShmOpenerWithoutCreatorRaises", test_shm_opener_without_creator_raises),
         ("ShmCrossProcessRoundtrip", test_shm_cross_process_roundtrip),
+        ("ShmUnlinkAfterClose", test_shm_unlink_after_close),
     ]
 
     print("=" * 70)

@@ -17,7 +17,7 @@ set(SLICK_SHM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-stream-buffer-multiplexer
     GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer-multiplexer.git
-    GIT_TAG main
+    GIT_TAG v2.0.0
 )
 FetchContent_MakeAvailable(slick-stream-buffer-multiplexer)
 
@@ -83,6 +83,19 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+# enable_read_last=False ('SLQ0') must match across languages, whichever creates the queue
+add_test(
+    NAME read_last_off_python_queue
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_interop.py --test read_last_off_python_queue
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME read_last_off_cpp_queue
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_interop.py --test read_last_off_cpp_queue
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 set_tests_properties(
     multiplexer_test
     multiplexer_mpmc_test
@@ -91,5 +104,7 @@ set_tests_properties(
     cpp_producers_python_consumer
     mixed_language_producers
     partial_registration_interop
+    read_last_off_python_queue
+    read_last_off_cpp_queue
     PROPERTIES TIMEOUT 120
 )
