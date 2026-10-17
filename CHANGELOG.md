@@ -1,5 +1,60 @@
 # Changelogs
 
+## [v2.2.0] - 2026-10-14
+
+Tracks C++ [slick-stream-buffer-multiplexer v2.2.0](https://github.com/SlickQuant/slick-stream-buffer-multiplexer/blob/main/CHANGELOG.md):
+a second kind of producer, a byte slick-queue, merged into the same globally ordered stream. The
+version moves from 2.0.0 to 2.2.0 to stay on the C++ number; C++ v2.1.0 changed no code of its
+own (its segment-lifetime change is in its C++ dependencies), and this package already leaves
+deleting a segment to an explicit `unlink()`. Nothing existing changes, and the shared-memory
+formats are unchanged.
+
+### Added
+- Queue producers. `add_queue_producer()` registers a byte `SlickQueue` (`element_size=1`, the C++
+  `slick::queue<uint8_t>`), built with the multiplexer's traits: in local memory
+  (`size=`, optionally `items_per_slot=`), as a shared-memory creator (add `name=`) or opener
+  (`name=` alone; size and `items_per_slot` come from the segment), or by adopting a byte
+  `SlickQueue` you already have (`queue=`). Only messages published through the returned handle
+  are multiplexed.
+- `ProducerQueue`, the queue producer's handle: `reserve()`, a writable `pq[index]` view and
+  `publish()`, with `publish()` also fanning a `{index, producer_id}` record into the shared queue.
+  Unlike a `ProducerBuffer`, any number of threads may publish through one. It also has `size`,
+  `items_per_slot`, `loss_count()`, `initial_reading_index()`, `own_buffer`, `use_shm`, `queue`,
+  `get_shm_name()`, `close()` and `unlink()`.
+- `get_producer_queue()`, `find_producer_queue()` and `get_producer_queues()`, the queue
+  counterparts of `get_producer_buffer()`, `find_producer()` and `get_producer_buffers()`.
+- `ProducerKind` (`STREAM_BUFFER` / `QUEUE`), as `.kind` on both handles, which now share a common
+  base with `producer_id`.
+- Tests: a queue producer suite (`tests/test_multiplexer_queue.py`, 19 tests, registered with
+  CTest), multi-writer and work-stealing MPMC tests, shared-memory tests including a
+  cross-process roundtrip, and C++/Python interop with a queue producer in each direction
+  (`cpp_mux_producer create-queue-producer` / `--queue-producer`, `cpp_mux_consumer
+  --queue-producer`).
+
+### Changed
+- Requires **slick-queue-py >= 2.1.0** (was 2.0.0), for `items_per_slot`.
+- `producer_id` is one namespace across both kinds: registering an id already held by either kind
+  raises `ValueError`. `has_producer()` and `producer_count()` count both kinds, while
+  `get_producer_buffer()`, `find_producer()` and `get_producer_buffers()` keep returning stream
+  buffer producers only - `None` for a queue producer's id.
+- `close()`, `unlink()` and `remove()` cover queue producer segments as well.
+- A consumer on this package before 2.2.0, or on C++ 2.1 or earlier, can share a record queue
+  with a 2.2 process. It has no queue producers, so it skips their records as unregistered,
+  without counting them as loss.
+- The interop tests build against C++ slick-stream-buffer-multiplexer `v2.2.0` (was `v2.0.0`).
+
+### Queue producer loss
+- A queue message whose bytes may have been overwritten is skipped and counted, not only one
+  whose control slot was lapped: messages differ in length, so a later reservation can cover an
+  older message's bytes without landing on its slot. Once the queue's reservation counter is more
+  than one ring past a message, the message is treated as lost. `read()` copies the bytes before
+  the check, so the check covers the copy it returns. It is conservative: a message lying in the
+  tail a wrapping reservation skipped is reported lost although its bytes are intact.
+- `ProducerQueue.loss_count()` is the inner queue's own counter and is not a record count:
+  slick-queue configures loss detection per queue, not per call, so with counting traits (the
+  slick-queue-py default) each lapped dereference adds slick-queue's skip distance to it.
+  `mux.loss_count()` remains the number to read.
+
 ## [v2.0.0] - 2026-09-13
 
 Tracks C++ [slick-stream-buffer-multiplexer v2.0.0](https://github.com/SlickQuant/slick-stream-buffer-multiplexer/blob/main/CHANGELOG.md)

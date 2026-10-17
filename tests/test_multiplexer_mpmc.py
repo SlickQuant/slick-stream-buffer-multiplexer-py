@@ -1,5 +1,6 @@
 """
-Multi-producer / multi-consumer stress tests for StreamBufferMultiplexer.
+Multi-producer / multi-consumer stress tests for StreamBufferMultiplexer,
+including queue producers.
 
 Mirrors slick-stream-buffer-multiplexer/tests/multiplexer_mpmc_tests.cpp
 (threads instead of std::thread; payload is packed "<IQ" producer_id+seq).
@@ -17,6 +18,7 @@ sys.path.insert(0, str(_root.parent / "slick-stream-buffer-py"))
 
 from slick_stream_buffer_multiplexer_py import (
     StreamBufferMultiplexer,
+    ProducerQueue,
     AtomicCursor,
     QueueTraits,
 )
@@ -274,6 +276,146 @@ def test_scan_loss_counter_is_a_different_number_from_multiplexer_loss():
     mux.close()
 
 
+def _publish(producer, data: bytes) -> None:
+    """Publish one message through either kind of producer handle."""
+    n = len(data)
+    if isinstance(producer, ProducerQueue):
+        index = producer.reserve(n)
+        producer[index][:n] = data
+        producer.publish(index, n)
+    else:
+        mv = producer.prepare(n)
+        mv[:] = data
+        producer.commit(n)
+        producer.consume(n)
+
+
+def test_many_threads_share_one_queue_producer():
+    """What a ProducerQueue allows and a ProducerBuffer does not: several threads
+    publishing through one handle. They share producer id 0, so the payload
+    carries the writer; a stream buffer producer runs alongside to mix the two
+    kinds. Each writer's own messages must arrive in the order it published
+    them, and nothing may be lost or duplicated."""
+    k_queue_writers = 4
+    k_writers = k_queue_writers + 1  # the last one drives the stream buffer producer
+    k_messages_per_writer = 200
+    k_consumers = 3
+    k_total = k_writers * k_messages_per_writer
+
+    mux = StreamBufferMultiplexer(shared_queue_size=2048)
+    shared = mux.add_queue_producer(0, size=1 << 16, items_per_slot=16)  # one slot per message
+    stream = mux.add_producer(1, capacity=1 << 16, control_size=256)
+
+    def writer(w: int):
+        target = shared if w < k_queue_writers else stream
+        for seq in range(k_messages_per_writer):
+            _publish(target, struct.pack(PAYLOAD_FMT, w, seq))
+
+    ok = [True] * k_consumers
+    received = [0] * k_consumers
+
+    def consumer(c: int):
+        cursor = 0
+        expected = [0] * k_writers
+        count = 0
+        while count < k_total:
+            rec, cursor = mux.read(cursor)
+            if not rec:
+                time.sleep(0)
+                continue
+            if rec.length != PAYLOAD_SIZE:
+                ok[c] = False
+                break
+            w, seq = struct.unpack(PAYLOAD_FMT, rec.data)
+            want_producer = 0 if w < k_queue_writers else 1
+            if w >= k_writers or rec.producer_id != want_producer or seq != expected[w]:
+                ok[c] = False
+                break
+            expected[w] += 1
+            count += 1
+        received[c] = count
+
+    writer_threads = [threading.Thread(target=writer, args=(w,)) for w in range(k_writers)]
+    consumer_threads = [threading.Thread(target=consumer, args=(c,))
+                        for c in range(k_consumers)]
+    for t in writer_threads + consumer_threads:
+        t.start()
+    for t in writer_threads + consumer_threads:
+        t.join(timeout=120)
+        assert not t.is_alive(), "thread timed out"
+
+    for c in range(k_consumers):
+        assert ok[c], f"consumer {c} observed unexpected data"
+        assert received[c] == k_total
+    assert mux.loss_count() == 0
+    assert shared.loss_count() == 0  # the ring never lapped, so no dereference found one
+    mux.close()
+
+
+def test_work_stealing_shared_cursor_over_mixed_producers():
+    """A shared atomic cursor hands each message to exactly one consumer,
+    whichever kind of producer it came from."""
+    k_producers = 4  # even ids are queue producers, odd ids stream buffer ones
+    k_messages_per_producer = 150
+    k_consumers = 4
+    k_total = k_producers * k_messages_per_producer
+
+    mux = StreamBufferMultiplexer(shared_queue_size=1024)
+    for pid in range(k_producers):
+        if pid % 2 == 0:
+            mux.add_queue_producer(pid, size=1 << 16, items_per_slot=16)
+        else:
+            mux.add_producer(pid, capacity=1 << 16, control_size=256)
+
+    def producer(pid: int):
+        target = (mux.find_producer_queue(pid) if pid % 2 == 0
+                  else mux.find_producer(pid))
+        for seq in range(k_messages_per_producer):
+            _publish(target, struct.pack(PAYLOAD_FMT, pid, seq))
+
+    producer_threads = [threading.Thread(target=producer, args=(pid,))
+                        for pid in range(k_producers)]
+    for t in producer_threads:
+        t.start()
+    for t in producer_threads:
+        t.join(timeout=120)
+        assert not t.is_alive()
+
+    cursor_buf = bytearray(8)
+    shared_cursor = AtomicCursor(cursor_buf, 0)
+    shared_cursor.store(0)
+    seen = [[] for _ in range(k_consumers)]
+
+    def consumer(c: int):
+        while True:
+            rec, _ = mux.read(shared_cursor)
+            if not rec:
+                break  # queue fully drained (producers already finished)
+            assert rec.length == PAYLOAD_SIZE
+            data_pid, data_seq = struct.unpack(PAYLOAD_FMT, rec.data)
+            assert data_pid == rec.producer_id
+            seen[c].append(data_pid * k_messages_per_producer + data_seq)
+
+    consumer_threads = [threading.Thread(target=consumer, args=(c,))
+                        for c in range(k_consumers)]
+    for t in consumer_threads:
+        t.start()
+    for t in consumer_threads:
+        t.join(timeout=120)
+        assert not t.is_alive()
+
+    union_count = [0] * k_total
+    for v in seen:
+        for idx in v:
+            union_count[idx] += 1
+    assert sum(union_count) == k_total
+    for i in range(k_total):
+        assert union_count[i] == 1, f"global index {i} delivered {union_count[i]} times"
+    assert mux.loss_count() == 0
+    shared_cursor.release()
+    mux.close()
+
+
 def run_all_tests():
     tests = [
         ("MultiThreadedBroadcast", test_multi_threaded_broadcast),
@@ -283,6 +425,9 @@ def run_all_tests():
         ("TraitsDisableLossCounting", test_traits_disable_loss_counting),
         ("ScanLossCounterIsADifferentNumberFromMultiplexerLoss",
          test_scan_loss_counter_is_a_different_number_from_multiplexer_loss),
+        ("ManyThreadsShareOneQueueProducer", test_many_threads_share_one_queue_producer),
+        ("WorkStealingSharedCursorOverMixedProducers",
+         test_work_stealing_shared_cursor_over_mixed_producers),
     ]
 
     print("=" * 70)

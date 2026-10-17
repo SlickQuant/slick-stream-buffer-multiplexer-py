@@ -25,7 +25,12 @@ sys.path.insert(0, str(_root))
 sys.path.insert(0, str(_root.parent / "slick-queue-py"))
 sys.path.insert(0, str(_root.parent / "slick-stream-buffer-py"))
 
-from slick_stream_buffer_multiplexer_py import StreamBufferMultiplexer, ProducerBuffer, QueueTraits
+from slick_stream_buffer_multiplexer_py import (
+    StreamBufferMultiplexer,
+    ProducerBuffer,
+    ProducerQueue,
+    QueueTraits,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,12 +62,19 @@ def interop_check_msg(data: bytes, expected_worker: int) -> int:
     return msg_num
 
 
-def publish_msg(pb: ProducerBuffer, msg_num: int) -> None:
-    data = interop_make_msg(pb.producer_id, msg_num)
-    mv = pb.prepare(len(data))
-    mv[:] = data
-    pb.commit(len(data))
-    pb.consume(len(data))
+def publish_msg(producer, msg_num: int) -> None:
+    """Publish one framed message through either kind of producer handle."""
+    data = interop_make_msg(producer.producer_id, msg_num)
+    n = len(data)
+    if isinstance(producer, ProducerQueue):
+        index = producer.reserve(n)
+        producer[index][:n] = data
+        producer.publish(index, n)
+    else:
+        mv = producer.prepare(n)
+        mv[:] = data
+        producer.commit(n)
+        producer.consume(n)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +390,77 @@ def test_read_last_off_cpp_queue():
             mux.unlink()
 
 
+def test_python_queue_producer_cpp_consumer():
+    """Python creates the queue, a shared-memory queue producer (items_per_slot
+    16, so the segment carries the 'SLQ3' marker) and a stream buffer producer,
+    and publishes through both; a C++ consumer registers each as its kind and
+    verifies global order and content."""
+    print("TEST: Python queue + stream buffer producers -> C++ consumer")
+    n = 50  # per producer
+    mux = StreamBufferMultiplexer(shared_queue_size=1024, name="mux_io_qp2c_records")
+    try:
+        q0 = mux.add_queue_producer(0, size=1 << 16, items_per_slot=16, name="mux_io_qp2c_q0")
+        p1 = mux.add_producer(1, capacity=1 << 16, control_size=256, name="mux_io_qp2c_p1")
+
+        consumer = subprocess.Popen(
+            [find_cpp_executable("cpp_mux_consumer"), mux.get_shm_name(), str(2 * n),
+             "--queue-producer", "0", q0.get_shm_name(),
+             "--producer", "1", p1.get_shm_name()],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        for i in range(n):  # interleave the two kinds
+            publish_msg(q0, i)
+            publish_msg(p1, i)
+
+        out, err = consumer.communicate(timeout=60)
+        assert consumer.returncode == 0, f"cpp_mux_consumer failed (rc={consumer.returncode}): {err}"
+        assert f"CONSUMED {2 * n}" in out, f"unexpected output: {out}"
+        assert f"PRODUCER 0 {n}" in out and f"PRODUCER 1 {n}" in out
+        print(f"  C++ consumed all {2 * n} messages from a Python queue and stream buffer producer")
+    finally:
+        mux.unlink()
+        mux.close()
+
+
+def test_cpp_queue_producer_python_consumer():
+    """Python creates the record queue; a C++ process creates a queue producer
+    segment (slick::queue<uint8_t> with items_per_slot 16) and publishes while a
+    Python stream buffer producer publishes alongside; Python opens the C++
+    queue producer by name - adopting its size and items_per_slot - and
+    consumes both."""
+    print("TEST: C++ queue producer + Python stream buffer producer -> Python consumer")
+    n = 50  # per producer
+    mux = StreamBufferMultiplexer(shared_queue_size=1024, name="mux_io_qc2p_records")
+    cpp_producer = None
+    try:
+        p1 = mux.add_producer(1, capacity=1 << 16, control_size=256, name="mux_io_qc2p_p1")
+
+        cpp_producer = subprocess.Popen(
+            [find_cpp_executable("cpp_mux_producer"), mux.get_shm_name(), "mux_io_qc2p_q0",
+             "0", str(n), "create-queue-producer", str(1 << 16), "16", "--hold"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _ready(cpp_producer)
+
+        q0 = mux.add_queue_producer(0, name="mux_io_qc2p_q0")
+        assert q0.size == 1 << 16
+        assert q0.items_per_slot == 16
+        assert not q0.own_buffer
+
+        for i in range(n):
+            publish_msg(p1, i)
+
+        python_read_all(mux, {0: n, 1: n})
+        print(f"  Python consumer saw all {2 * n} messages from both languages and kinds")
+
+        line = cpp_producer.stdout.readline()
+        assert f"PUBLISHED {n}" in line, f"unexpected producer output: {line!r}"
+    finally:
+        if cpp_producer is not None:
+            _finish(cpp_producer)
+        mux.unlink()
+        mux.close()
+
+
 ALL_TESTS = {
     "python_producers_cpp_consumer": test_python_producers_cpp_consumer,
     "cpp_producers_python_consumer": test_cpp_producers_python_consumer,
@@ -385,6 +468,8 @@ ALL_TESTS = {
     "partial_registration_interop": test_partial_registration_interop,
     "read_last_off_python_queue": test_read_last_off_python_queue,
     "read_last_off_cpp_queue": test_read_last_off_cpp_queue,
+    "python_queue_producer_cpp_consumer": test_python_queue_producer_cpp_consumer,
+    "cpp_queue_producer_python_consumer": test_cpp_queue_producer_python_consumer,
 }
 
 

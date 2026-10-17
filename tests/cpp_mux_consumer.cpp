@@ -4,7 +4,11 @@
 // Usage:
 //   cpp_mux_consumer <queue_name> <num_messages>
 //                    --producer <id> <shm_name> [--producer <id> <shm_name> ...]
+//                    [--queue-producer <id> <shm_name> ...]
 //                    [--timeout-s N] [--no-read-last]
+//
+//   --producer       register a stream buffer producer segment
+//   --queue-producer register a queue producer (slick::queue<uint8_t>) segment
 //
 // Opens the shared record queue and the listed producer segments, then reads
 // num_messages messages in global order. Every message's framing must be
@@ -35,6 +39,7 @@ struct options {
     int num_messages = 0;
     int timeout_s = 30;
     std::map<uint32_t, const char*> producer_names;
+    std::map<uint32_t, const char*> queue_producer_names;
 };
 
 template<typename Traits>
@@ -43,6 +48,9 @@ int consume(const options& opt) {
         slick::basic_stream_buffer_multiplexer<Traits> mux(opt.queue_name);
         for (const auto& [id, name] : opt.producer_names) {
             mux.add_producer(id, name);
+        }
+        for (const auto& [id, name] : opt.queue_producer_names) {
+            mux.add_queue_producer(id, name);
         }
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(opt.timeout_s);
@@ -95,7 +103,8 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
             "Usage: %s <queue_name> <num_messages> --producer <id> <shm_name> "
-            "[--producer <id> <shm_name> ...] [--timeout-s N] [--no-read-last]\n", argv[0]);
+            "[--producer <id> <shm_name> ...] [--queue-producer <id> <shm_name> ...] "
+            "[--timeout-s N] [--no-read-last]\n", argv[0]);
         return 2;
     }
 
@@ -107,6 +116,9 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--producer") == 0 && i + 2 < argc) {
             opt.producer_names[static_cast<uint32_t>(std::atoi(argv[i + 1]))] = argv[i + 2];
+            i += 2;
+        } else if (std::strcmp(argv[i], "--queue-producer") == 0 && i + 2 < argc) {
+            opt.queue_producer_names[static_cast<uint32_t>(std::atoi(argv[i + 1]))] = argv[i + 2];
             i += 2;
         } else if (std::strcmp(argv[i], "--timeout-s") == 0 && i + 1 < argc) {
             opt.timeout_s = std::atoi(argv[i + 1]);

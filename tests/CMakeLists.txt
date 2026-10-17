@@ -17,7 +17,7 @@ set(SLICK_SHM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-stream-buffer-multiplexer
     GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer-multiplexer.git
-    GIT_TAG v2.0.0
+    GIT_TAG v2.2.0
 )
 FetchContent_MakeAvailable(slick-stream-buffer-multiplexer)
 
@@ -55,6 +55,12 @@ add_test(
 add_test(
     NAME multiplexer_shm_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_multiplexer_shm.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME multiplexer_queue_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_multiplexer_queue.py
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
@@ -96,10 +102,26 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+# Queue producers (slick::queue<uint8_t>) across languages, in both directions
+add_test(
+    NAME python_queue_producer_cpp_consumer
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_interop.py --test python_queue_producer_cpp_consumer
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME cpp_queue_producer_python_consumer
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_interop.py --test cpp_queue_producer_python_consumer
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 set_tests_properties(
     multiplexer_test
     multiplexer_mpmc_test
     multiplexer_shm_test
+    multiplexer_queue_test
+    python_queue_producer_cpp_consumer
+    cpp_queue_producer_python_consumer
     python_producers_cpp_consumer
     cpp_producers_python_consumer
     mixed_language_producers

@@ -2,8 +2,9 @@
 
 The Python implementation is binary-compatible with the C++
 `slick::stream_buffer_multiplexer` at the shared memory level — the shared record queue
-('SLQ1', or 'SLQ0' with `enable_read_last` off; 16-byte elements) and every producer segment
-('SSB1') match byte-for-byte. Peers must agree on `enable_read_last`, the one trait recorded in
+('SLQ1', or 'SLQ0' with `enable_read_last` off; 16-byte elements), every stream buffer
+producer segment ('SSB1') and every queue producer segment (a slick-queue with 1-byte elements)
+match byte-for-byte. Peers must agree on `enable_read_last`, the one trait recorded in
 the queue's header (see [Traits](#traits-are-a-constructor-argument-not-a-template-parameter)).
 The *language-level* API differs in the following ways.
 
@@ -17,6 +18,11 @@ The *language-level* API differs in the following ways.
 | `add_producer(id, cap, ctl)` | `add_producer(id, capacity=cap, control_size=ctl)` |
 | `add_producer(id, cap, ctl, "name")` | `add_producer(id, capacity=cap, control_size=ctl, name="name")` |
 | `add_producer(id, "name")` | `add_producer(id, name="name")` |
+| `add_queue_producer(id, size)` | `add_queue_producer(id, size=size)` |
+| `add_queue_producer(id, size, items_per_slot)` | `add_queue_producer(id, size=size, items_per_slot=ips)` |
+| `add_queue_producer(id, size, "name")` / `(id, size, items_per_slot, "name")` | `add_queue_producer(id, size=size, [items_per_slot=ips,] name="name")` |
+| `add_queue_producer(id, "name")` | `add_queue_producer(id, name="name")` (an explicit `items_per_slot=` must match the segment) |
+| `add_queue_producer(id, std::shared_ptr<queue_type>)` | `add_queue_producer(id, queue=q)` |
 | throws `std::invalid_argument` (duplicate id, bad sizes) | raises `ValueError` |
 | `uint32_t producer_id` (range enforced by the type) | raises `ValueError` outside `0..0xFFFFFFFF`, `TypeError` for a non-integer |
 | throws `std::runtime_error` (shm failures) | raises `RuntimeError`, `ValueError` (queue geometry mismatch), or `FileNotFoundError` (missing segment) |
@@ -57,16 +63,42 @@ C++ exposes both `stream_buffer()` (reference) and `stream_buffer_ptr()`
 Similarly, `get_producer_buffer()` and `find_producer()` both return the same
 `ProducerBuffer` object (or `None`).
 
+## Queue producers
+
+C++ `producer_queue::operator[](index)` returns a `uint8_t*` to the reservation; Python's
+`ProducerQueue[index]` returns a writable `memoryview` from `index` to the end of the ring's data
+array, of which the reserved `n` bytes are the first `n` — write them as
+`pq[index][:n] = payload`. (A reservation never splits across the end of the ring, so they are
+always contiguous.) `SlickQueue`'s own `[]` is one element wide, so it cannot stand in for this.
+
+C++ `queue_type` is `slick::queue<uint8_t, Traits>`, so adopting a queue with different traits
+fails to compile. Python builds a created queue with the multiplexer's traits too, but accepts an
+adopted `SlickQueue` whatever its traits — only `enable_read_last` reaches shared memory, and
+slick-queue-py checks that against the segment — and requires only `element_size == 1`
+(`ValueError` otherwise, `TypeError` for something that is not a `SlickQueue`).
+
+`queue` is the single accessor for the underlying `SlickQueue`, as `stream_buffer` is for
+`ProducerBuffer` (C++ has both `queue()` and `queue_ptr()`). `size`, `items_per_slot`,
+`own_buffer` and `use_shm` are properties, matching `SlickQueue`'s attributes.
+
+C++ `slick::producer_kind::stream_buffer` / `::queue` is `ProducerKind.STREAM_BUFFER` /
+`ProducerKind.QUEUE`, on each handle as `.kind`.
+
+The payload-retention check (a queue message is skipped once the reservation counter is more than
+one ring past it) runs after `read()` has copied the bytes, so in Python it covers the copy handed
+back; in C++, which hands back a pointer, a producer can still overwrite the bytes after the check.
+
 ## Producer lookup
 
-C++ uses a dense vector for producer ids < 4096 with a hash-map fallback; Python uses a
-plain dict for all ids (already O(1) — the dense-path micro-optimization is meaningless
-in Python).
+C++ uses one dense vector of both kinds for producer ids < 4096 with a hash-map fallback;
+Python uses one plain dict of both kinds for all ids (already O(1) — the dense-path
+micro-optimization is meaningless in Python), and each handle dereferences its own records where
+C++ branches on the kind.
 
-`get_producer_buffers()` returns a `const` map reference in C++; Python returns a cached
-read-only `types.MappingProxyType` over the same dict — mutation raises, later
-`add_producer()` calls still show through, and the call allocates nothing. Iteration order
-is insertion order, which C++'s `unordered_map` does not promise.
+`get_producer_buffers()` and `get_producer_queues()` return `const` map references in C++;
+Python returns cached read-only `types.MappingProxyType`s over the same dicts — mutation raises,
+later registrations still show through, and the call allocates nothing. Iteration order is
+insertion order, which C++'s `unordered_map` does not promise.
 
 ## Traits are a constructor argument, not a template parameter
 
@@ -122,24 +154,30 @@ either way. All counters are per-instance, not shared through the segments.
 traits with `count_loss` off, so that counter only moves for reads the caller makes directly
 through `producer.stream_buffer.read(cursor, traits)`.
 
-## producer_buffer is not movable in C++
+`ProducerQueue.loss_count()` is the inner queue's own counter on both sides, and the multiplexer's
+lapped dereferences reach it on both sides. It moves by default in Python only because
+slick-queue-py's default traits count; in a C++ release build of the default configuration it
+reads 0.
 
-C++ deletes `producer_buffer`'s copy and move operations, because the multiplexer keeps a raw
-pointer to the same object its `shared_ptr` names, and moving one out would leave both pointing
-at an emptied object. Python has no moves and rebinding a name copies a reference, so there is
-nothing to delete — `ProducerBuffer` has no equivalent restriction.
+## Producer handles are not movable in C++
+
+C++ deletes the copy and move operations of `producer_buffer` and `producer_queue`, because the
+multiplexer keeps a raw pointer to the same object its `shared_ptr` names, and moving one out
+would leave both pointing at an emptied object. Python has no moves and rebinding a name copies a
+reference, so there is nothing to delete — `ProducerBuffer` and `ProducerQueue` have no
+equivalent restriction.
 
 ## Lifecycle
 
 Python adds explicit lifecycle management that C++ handles via RAII:
 
-- `close()` — detach from all producer segments and the queue segment; the registration table is
-  kept, so a later `unlink()` still reaches every producer
-- `unlink()` — delete the queue segment and all registered producers' segments; valid before or
-  after `close()` (close every handle, then unlink once), and a no-op when repeated
+- `close()` — detach from all producer segments, of both kinds, and the queue segment; the
+  registration tables are kept, so a later `unlink()` still reaches every producer
+- `unlink()` — delete the queue segment and all registered producers' segments, of both kinds;
+  valid before or after `close()` (close every handle, then unlink once), and a no-op when repeated
 - context manager support: `with StreamBufferMultiplexer(...) as mux: ...`
-- `get_shm_name()` — on the multiplexer (queue segment) and on each `ProducerBuffer`,
-  the exact names to pass to C++ (`/`-prefixed on POSIX)
+- `get_shm_name()` — on the multiplexer (queue segment) and on each `ProducerBuffer` and
+  `ProducerQueue`, the exact names to pass to C++ (`/`-prefixed on POSIX)
 
 `remove(name)` is the one lifecycle call both sides share, with the same contract: unlink a
 segment by name without attaching to it, returning `True` on success and, on Windows, always

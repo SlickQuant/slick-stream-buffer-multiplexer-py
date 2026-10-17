@@ -5,10 +5,16 @@
 //   cpp_mux_producer <queue_name> <producer_shm_name> <producer_id> <num_messages>
 //                    [create-queue <queue_size>]
 //                    [create-producer <capacity> <control_size>]
+//                    [create-queue-producer <size> <items_per_slot>]
+//                    [--queue-producer]
 //                    [--hold] [--delay-us N] [--no-read-last]
 //
 //   create-queue     create the shared record queue; otherwise open existing
-//   create-producer  create the producer segment; otherwise open existing
+//   create-producer  create a stream buffer producer segment; otherwise open existing
+//   create-queue-producer
+//                    create a queue producer (slick::queue<uint8_t>) segment instead
+//   --queue-producer the producer is a queue producer: open its existing segment
+//                    (implied by create-queue-producer)
 //   --hold           after publishing, wait for a line on stdin before exiting
 //                    (keeps the segments alive on Windows so Python can attach)
 //   --delay-us N     sleep N microseconds between messages
@@ -43,9 +49,47 @@ struct options {
     bool create_producer = false;
     uint64_t capacity = 0;
     uint32_t control_size = 0;
+    bool queue_producer = false;
+    uint32_t producer_queue_size = 0;
+    uint32_t items_per_slot = 0;
     bool hold = false;
     int delay_us = 0;
 };
+
+/// Publish num_messages framed messages through a stream buffer producer.
+template<typename ProducerBuffer>
+bool publish_stream(ProducerBuffer& pb, const options& opt) {
+    for (int i = 0; i < opt.num_messages; ++i) {
+        const std::size_t len = interop_msg_length(static_cast<uint32_t>(i));
+        auto [ptr, sz] = pb.prepare(len);
+        if (ptr == nullptr || sz != len) {
+            std::fprintf(stderr, "prepare(%zu) failed at message %d\n", len, i);
+            return false;
+        }
+        interop_write_msg(ptr, opt.producer_id, static_cast<uint32_t>(i));
+        pb.commit(len);
+        pb.consume(len);
+        if (opt.delay_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(opt.delay_us));
+        }
+    }
+    return true;
+}
+
+/// Publish num_messages framed messages through a queue producer.
+template<typename ProducerQueue>
+bool publish_queue(ProducerQueue& pq, const options& opt) {
+    for (int i = 0; i < opt.num_messages; ++i) {
+        const auto len = static_cast<uint32_t>(interop_msg_length(static_cast<uint32_t>(i)));
+        const uint64_t index = pq.reserve(len);
+        interop_write_msg(pq[index], opt.producer_id, static_cast<uint32_t>(i));
+        pq.publish(index, len);
+        if (opt.delay_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(opt.delay_us));
+        }
+    }
+    return true;
+}
 
 template<typename Traits>
 int produce(const options& opt) {
@@ -59,7 +103,13 @@ int produce(const options& opt) {
         }
 
         std::shared_ptr<typename multiplexer::producer_buffer> pb;
-        if (opt.create_producer) {
+        std::shared_ptr<typename multiplexer::producer_queue> pq;
+        if (opt.queue_producer) {
+            pq = opt.producer_queue_size != 0
+                ? mux->add_queue_producer(opt.producer_id, opt.producer_queue_size,
+                                          opt.items_per_slot, opt.producer_shm_name)
+                : mux->add_queue_producer(opt.producer_id, opt.producer_shm_name);
+        } else if (opt.create_producer) {
             pb = mux->add_producer(opt.producer_id, opt.capacity, opt.control_size,
                                    opt.producer_shm_name);
         } else {
@@ -69,19 +119,8 @@ int produce(const options& opt) {
         std::printf("READY\n");
         std::fflush(stdout);
 
-        for (int i = 0; i < opt.num_messages; ++i) {
-            const std::size_t len = interop_msg_length(static_cast<uint32_t>(i));
-            auto [ptr, sz] = pb->prepare(len);
-            if (ptr == nullptr || sz != len) {
-                std::fprintf(stderr, "prepare(%zu) failed at message %d\n", len, i);
-                return 1;
-            }
-            interop_write_msg(ptr, opt.producer_id, static_cast<uint32_t>(i));
-            pb->commit(len);
-            pb->consume(len);
-            if (opt.delay_us > 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(opt.delay_us));
-            }
+        if (!(pq ? publish_queue(*pq, opt) : publish_stream(*pb, opt))) {
+            return 1;
         }
 
         std::printf("PUBLISHED %d\n", opt.num_messages);
@@ -105,6 +144,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "Usage: %s <queue_name> <producer_shm_name> <producer_id> <num_messages> "
             "[create-queue <queue_size>] [create-producer <capacity> <control_size>] "
+            "[create-queue-producer <size> <items_per_slot>] [--queue-producer] "
             "[--hold] [--delay-us N] [--no-read-last]\n", argv[0]);
         return 2;
     }
@@ -126,6 +166,13 @@ int main(int argc, char** argv) {
             opt.capacity = std::strtoull(argv[i + 1], nullptr, 10);
             opt.control_size = static_cast<uint32_t>(std::strtoul(argv[i + 2], nullptr, 10));
             i += 2;
+        } else if (std::strcmp(argv[i], "create-queue-producer") == 0 && i + 2 < argc) {
+            opt.queue_producer = true;
+            opt.producer_queue_size = static_cast<uint32_t>(std::strtoul(argv[i + 1], nullptr, 10));
+            opt.items_per_slot = static_cast<uint32_t>(std::strtoul(argv[i + 2], nullptr, 10));
+            i += 2;
+        } else if (std::strcmp(argv[i], "--queue-producer") == 0) {
+            opt.queue_producer = true;
         } else if (std::strcmp(argv[i], "--hold") == 0) {
             opt.hold = true;
         } else if (std::strcmp(argv[i], "--delay-us") == 0 && i + 1 < argc) {
