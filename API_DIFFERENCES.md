@@ -182,3 +182,9 @@ Python adds explicit lifecycle management that C++ handles via RAII:
 `remove(name)` is the one lifecycle call both sides share, with the same contract: unlink a
 segment by name without attaching to it, returning `True` on success and, on Windows, always
 `True` because a section dies with its last handle.
+
+Neither side deletes a segment on its own: not the C++ destructors (since v2.1.0), and not
+Python's `close()`, context manager or process exit. Python's dependencies keep their segments out
+of `multiprocessing`'s resource tracker for this, which would otherwise unlink them when the
+process exits. Each inner ring's own `remove_shm()` is reachable on both sides, through
+`stream_buffer` / `queue` in Python and `stream_buffer()` / `queue()` in C++.

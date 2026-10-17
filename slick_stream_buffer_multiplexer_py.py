@@ -76,6 +76,12 @@ Caveats (same as C++):
   propagated from SlickStreamBuffer.consume() before any state moves - so
   nothing is published to either the producer's ring or the shared record
   queue. A queue message is limited to the queue's size by SlickQueue.reserve().
+- No segment is ever unlinked on its own - not by close(), the context
+  manager or process exit, including through multiprocessing's resource
+  tracker, which slick-queue-py and slick-stream-buffer-py keep their segments
+  out of. A restarted producer therefore reattaches to the segments its
+  consumers still map. The coordinating process deletes them with unlink() or
+  remove(name).
 """
 from __future__ import annotations
 
@@ -350,11 +356,6 @@ class ProducerQueue(_Producer):
         # items_per_slot - 1, for _dereference(): read() advances a cursor by the
         # whole reservation, which is the message length rounded up to this.
         self._item_mask = queue.items_per_slot - 1
-        # the queue's SharedMemory, held for unlink() for the same reason the
-        # multiplexer holds its record queue's: SlickQueue.close() drops its own
-        # handle, after which SlickQueue.unlink() silently does nothing. None for
-        # local memory.
-        self._shm = getattr(queue, '_shm', None)
 
     # ------------------------------------------------------------------
     # Producer side (any number of threads) - forwards to the inner queue
@@ -457,15 +458,11 @@ class ProducerQueue(_Producer):
 
     def unlink(self) -> None:
         """Unlink (delete) the underlying shared memory segment, if any. Valid
-        before or after close(), and a no-op when repeated."""
-        shm = self._shm
-        if shm is None:
-            return
-        self._shm = None  # unlink once, however many times this is called
-        try:
-            shm.unlink()
-        except Exception:
-            pass
+        before or after close(), and a no-op when repeated (see
+        SlickQueue.unlink()). The once-only guard lives on the queue, so an
+        adopted queue registered with several multiplexers is still unlinked
+        once."""
+        self._queue.unlink()
 
     def _dereference(self, sequence: int) -> MultiplexRecord:
         """Dereference a shared-queue record into this producer's queue. Falsy
@@ -552,10 +549,6 @@ class StreamBufferMultiplexer:
                 raise ValueError("shared_queue_size or name must be provided")
             self._shared_queue = SlickQueue(name=name, element_size=RECORD_SIZE,
                                             traits=traits)
-        # the queue's SharedMemory, held for unlink(): SlickQueue.close() drops
-        # its own handle, after which SlickQueue.unlink() silently does nothing -
-        # yet close-then-unlink is the documented order. None for local memory.
-        self._shared_queue_shm = getattr(self._shared_queue, '_shm', None)
 
         # One table per kind - what get_producer_buffers() / get_producer_queues()
         # hand out - plus one of every producer for read(), the counterpart of the
@@ -586,15 +579,21 @@ class StreamBufferMultiplexer:
 
     @staticmethod
     def remove(name: str) -> bool:
-        """Remove a shared memory segment by name, the stale-segment recovery step.
+        """Remove a shared memory segment by name: the explicit cleanup step, and
+        the stale-segment recovery step.
 
         Applies to every kind of name this class creates - a shared record
         queue's, a producer stream buffer's and a producer queue's - since all
-        are plain shared memory segments underneath. Use it when a previous run died
-        mid-initialization and left a segment wedged, which construction over
-        that name reports by raising::
+        are plain shared memory segments underneath. Nothing unlinks a segment
+        on close() or process exit, so on POSIX a name outlives every process
+        that used it and the next creator attaches to it instead of starting
+        fresh. Call this from whichever process coordinates the lifetime: at
+        startup for a clean start, or at shutdown once no peer will attach
+        again. It also clears a segment a previous run left wedged by dying
+        mid-initialization, which construction over that name reports by
+        raising::
 
-            StreamBufferMultiplexer.remove("md_records")   # clear a dead run
+            StreamBufferMultiplexer.remove("md_records")   # clear what the last run left
             mux = StreamBufferMultiplexer(shared_queue_size=1024, name="md_records")
 
         Returns:
@@ -845,6 +844,10 @@ class StreamBufferMultiplexer:
         """Unlink (delete) the shared record queue segment and all registered
         producers' segments, of both kinds.
 
+        No multiplexer does this on its own - not close(), not the context
+        manager and not process exit, as in C++ - so call it from the process
+        that coordinates the segments' lifetime, once no peer will attach again.
+
         Valid before or after close(); the documented order is the
         ``shared_memory`` idiom - close every handle, then unlink once. Deleting
         a name never touches mappings that already exist. Unlinking twice is a
@@ -856,12 +859,8 @@ class StreamBufferMultiplexer:
                 producer.unlink()  # by saved name, once - valid after close()
             except Exception:
                 pass
-        shm = self._shared_queue_shm
-        if shm is None:
-            return
-        self._shared_queue_shm = None  # unlink once, however many times this is called
         try:
-            shm.unlink()
+            self._shared_queue.unlink()  # likewise
         except Exception:
             pass
 

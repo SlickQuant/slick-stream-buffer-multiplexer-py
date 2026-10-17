@@ -9,7 +9,7 @@ every peer of a shared queue agrees on `enable_read_last` (see
 [`enable_read_last` must match on every peer](#enable_read_last-must-match-on-every-peer)).
 
 Tracks C++ `slick/stream_buffer_multiplexer.hpp` **v2.2.0**, and requires slick-queue-py >=
-2.1.0 and slick-stream-buffer-py >= 2.0.0. The shared-memory formats are unchanged
+2.3.0 and slick-stream-buffer-py >= 2.1.0. The shared-memory formats are unchanged
 (`'SLQ1'` / `'SSB1'`), so segments written by v0.1.0 or by a C++ v1.x process are still
 readable with the default traits.
 
@@ -47,9 +47,10 @@ records referencing other producer ids are silently skipped (not counted as loss
 ## Requirements
 
 - Python 3.8+
-- [slick-queue-py](https://github.com/SlickQuant/slick-queue-py) >= 2.1.0 (queue producers need
-  its `items_per_slot`)
-- [slick-stream-buffer-py](https://github.com/SlickQuant/slick-stream-buffer-py) >= 2.0.0
+- [slick-queue-py](https://github.com/SlickQuant/slick-queue-py) >= 2.3.0 (queue producers need
+  its `items_per_slot`; 2.3.0 is the release whose segments outlive their creator)
+- [slick-stream-buffer-py](https://github.com/SlickQuant/slick-stream-buffer-py) >= 2.1.0 (likewise
+  for segment lifetime - see [Segment lifetime](#segment-lifetime))
 
 Both dependencies bundle a small C++ extension for `std::atomic` operations; this package itself
 is pure Python.
@@ -141,6 +142,8 @@ accessors return `None` for the other kind's ids.
 from slick_stream_buffer_multiplexer_py import AtomicCursor
 from multiprocessing.shared_memory import SharedMemory
 
+# On Python 3.13+ add track=False, or the resource tracker unlinks the cursor's
+# segment when this process exits - see Segment lifetime
 cursor_shm = SharedMemory(name="mux_cursor", create=True, size=8)
 shared_cursor = AtomicCursor(cursor_shm.buf, 0)
 
@@ -251,28 +254,53 @@ inner_loss = sum(p.loss_count() for p in mux.get_producer_buffers().values())
 queues = {pid: p.size for pid, p in mux.get_producer_queues().items()}
 ```
 
-## Shutdown
+## Segment lifetime
 
-Close every handle, then unlink once — the usual `shared_memory` idiom:
+Closing a multiplexer or a producer handle, leaving a `with` block, or exiting the process never
+deletes a shared-memory segment - not even one this process created - matching C++ v2.1.0 and
+later. On POSIX a name therefore stays in `/dev/shm` until it is removed explicitly, and a creator
+that finds it attaches to the existing segment instead of starting fresh: the shared record queue
+still holds its records, a producer's `own_buffer` is `False` - for either kind of producer - and a
+creator passing a different geometry raises. That is what lets a restarted producer rejoin
+consumers that are still attached.
+
+slick-queue-py (2.3.0+) and slick-stream-buffer-py (2.1.0+) keep their segments out of
+`multiprocessing`'s resource tracker for this, since it would otherwise unlink them when the
+process exits - before Python 3.13, even in a process that only attached. A `SharedMemory` your own
+code opens, such as one holding an `AtomicCursor`, is still tracked unless you pass `track=False`.
+
+Whichever process coordinates the lifetime deletes the segments - at shutdown once no peer will
+attach again, by closing every handle and then unlinking once (the usual `shared_memory` idiom):
 
 ```python
 mux.close()      # or leave a `with StreamBufferMultiplexer(...) as mux:` block
 mux.unlink()     # deletes the record queue and every registered producer's segment, both kinds
 ```
 
-`close()` keeps the registration table so `unlink()` can still reach each producer's segment, and
-`unlink()` runs once: repeating it never deletes a segment a later run has created under the same
-name. On Windows `unlink()` is a no-op — a section disappears once its last handle closes.
+or at startup, by name, for a clean start (see below). `close()` keeps the registration table so
+`unlink()` can still reach each producer's segment, and `unlink()` runs once: repeating it never
+deletes a segment a later run has created under the same name. On Windows `unlink()` is a no-op —
+a section disappears once its last handle closes.
 
-## Stale-segment recovery
+> **Upgrading from 2.0.** Before slick-queue-py 2.3.0 and slick-stream-buffer-py 2.1.0, a segment
+> on POSIX was unlinked by the resource tracker when the process that created it exited - and,
+> before Python 3.13, when any process that attached to it did. A producer that exited first
+> therefore orphaned every consumer still attached. Code that relied on that cleanup now leaves
+> segments behind and attaches to them on its next run - call `unlink()` at shutdown or
+> `remove(name)` at startup.
 
-`StreamBufferMultiplexer.remove(name)` unlinks a segment by name — it works for every kind this
-class creates, a shared record queue's, a producer stream buffer's and a producer queue's, since
-all are plain shared memory segments underneath. Use it when a previous run died mid-initialization and left a
-segment wedged, which construction over that name reports by raising:
+## Removing segments by name
+
+`StreamBufferMultiplexer.remove(name)` unlinks a segment by name without attaching to it — it
+works for every kind this class creates, a shared record queue's, a producer stream buffer's and a
+producer queue's, since all are plain shared memory segments underneath. Use it at startup for a
+clean start, and to clear a segment a previous run left wedged by dying mid-initialization, which
+construction over that name reports by raising:
 
 ```python
-StreamBufferMultiplexer.remove("md_records")        # clear what a dead run left
+StreamBufferMultiplexer.remove("md_records")        # shared record queue
+StreamBufferMultiplexer.remove("md_p0")             # a producer's stream buffer
+StreamBufferMultiplexer.remove("md_q2")             # a producer's queue
 mux = StreamBufferMultiplexer(shared_queue_size=1024, name="md_records")
 ```
 

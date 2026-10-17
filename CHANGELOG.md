@@ -4,10 +4,24 @@
 
 Tracks C++ [slick-stream-buffer-multiplexer v2.2.0](https://github.com/SlickQuant/slick-stream-buffer-multiplexer/blob/main/CHANGELOG.md):
 a second kind of producer, a byte slick-queue, merged into the same globally ordered stream. The
-version moves from 2.0.0 to 2.2.0 to stay on the C++ number; C++ v2.1.0 changed no code of its
-own (its segment-lifetime change is in its C++ dependencies), and this package already leaves
-deleting a segment to an explicit `unlink()`. Nothing existing changes, and the shared-memory
-formats are unchanged.
+version moves from 2.0.0 to 2.2.0 to stay on the C++ number. C++ v2.1.0 changed no code of its
+own - its segment-lifetime change is in its C++ dependencies - and that change reaches this
+package the same way, through slick-queue-py 2.3.0 and slick-stream-buffer-py 2.1.0 (see Segment
+lifetime). The shared-memory formats are unchanged.
+
+### Segment lifetime (behavior change)
+- On POSIX, a segment is no longer unlinked when the process that created it exits, nor - before
+  Python 3.13 - when a process that only attached to it exits. Both happened through
+  `multiprocessing`'s resource tracker, which the dependencies now keep their segments out of. A
+  producer that exited first therefore orphaned every consumer still attached, and its restart
+  silently created a fresh segment under the same name that those consumers never saw. A segment
+  now lives until `unlink()` or `remove(name)`, so a restarted producer reattaches to it and
+  keeps its contents, as in C++ 2.1.0 and later. Windows is unaffected: a section dies with its
+  last handle.
+- Migration: code that relied on that cleanup now leaves segments in `/dev/shm` and attaches to
+  them on its next run - `own_buffer` is `False`, and a creator with a different geometry raises.
+  Call `unlink()` from the process that coordinates the segments' lifetime at shutdown, or
+  `remove(name)` at startup.
 
 ### Added
 - Queue producers. `add_queue_producer()` registers a byte `SlickQueue` (`element_size=1`, the C++
@@ -27,12 +41,15 @@ formats are unchanged.
   base with `producer_id`.
 - Tests: a queue producer suite (`tests/test_multiplexer_queue.py`, 19 tests, registered with
   CTest), multi-writer and work-stealing MPMC tests, shared-memory tests including a
-  cross-process roundtrip, and C++/Python interop with a queue producer in each direction
+  cross-process roundtrip, C++/Python interop with a queue producer in each direction
   (`cpp_mux_producer create-queue-producer` / `--queue-producer`, `cpp_mux_consumer
-  --queue-producer`).
+  --queue-producer`), and segment lifetime: `unlink()` leaves the resource tracker alone, and
+  neither a creator's nor an attacher's exit removes the record queue or either kind of producer
+  segment.
 
 ### Changed
-- Requires **slick-queue-py >= 2.1.0** (was 2.0.0), for `items_per_slot`.
+- Requires **slick-queue-py >= 2.3.0** (was 2.0.0), for `items_per_slot` and segment lifetime,
+  and **slick-stream-buffer-py >= 2.1.0** (was 2.0.0), for segment lifetime.
 - `producer_id` is one namespace across both kinds: registering an id already held by either kind
   raises `ValueError`. `has_producer()` and `producer_count()` count both kinds, while
   `get_producer_buffer()`, `find_producer()` and `get_producer_buffers()` keep returning stream

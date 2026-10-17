@@ -521,6 +521,147 @@ def test_shm_unlink_after_close_covers_queue_producers():
             successor.unlink()
 
 
+# ---------------------------------------------------------------------------
+# Segment lifetime: nothing unlinks a segment on its own (C++ v2.1.0+)
+# ---------------------------------------------------------------------------
+
+def _remove_all(names) -> None:
+    for n in names:
+        StreamBufferMultiplexer.remove(n)
+
+
+def _read_all(q: str, p0: str, q1: str):
+    """Open the record queue and both producers by name and read every message."""
+    mux = StreamBufferMultiplexer(name=q)
+    try:
+        mux.add_producer(0, name=p0)
+        mux.add_queue_producer(1, name=q1)
+        out = []
+        cursor = 0
+        while True:
+            rec, cursor = mux.read(cursor)
+            if not rec:
+                return out
+            out.append((rec.producer_id, bytes(rec.data)))
+    finally:
+        mux.close()
+
+
+# A fresh interpreter, so it has its own resource tracker - a multiprocessing
+# child would share the parent's, and the parent's exit would be what unlinked
+# the names.
+_LIFETIME_CHILD = r"""
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+for p in (root, root.parent / "slick-queue-py", root.parent / "slick-stream-buffer-py"):
+    sys.path.insert(0, str(p))
+from slick_stream_buffer_multiplexer_py import StreamBufferMultiplexer
+q, p0, q1, mode, tag = sys.argv[2:7]
+if mode == 'create':
+    mux = StreamBufferMultiplexer(shared_queue_size=64, name=q)
+    pb = mux.add_producer(0, capacity=1024, control_size=16, name=p0)
+    pq = mux.add_queue_producer(1, size=1024, items_per_slot=16, name=q1)
+    assert pb.own_buffer and pq.own_buffer, "child expected to create the segments"
+else:
+    mux = StreamBufferMultiplexer(name=q)
+    pb = mux.add_producer(0, name=p0)
+    pq = mux.add_queue_producer(1, name=q1)
+data = tag.encode()
+mv = pb.prepare(len(data))
+mv[:] = data
+pb.commit(len(data))
+pb.consume(len(data))
+i = pq.reserve(len(data))
+pq[i][:len(data)] = data
+pq.publish(i, len(data))
+mux.close()
+"""
+
+
+def _run_lifetime_child(q: str, p0: str, q1: str, mode: str, tag: str) -> None:
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "-c", _LIFETIME_CHILD, str(_root), q, p0, q1, mode, tag],
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"child failed:\n{result.stdout}\n{result.stderr}"
+    # The tracker warns about every registered name it cleans up at shutdown
+    assert "resource_tracker" not in result.stderr, result.stderr
+
+
+def test_shm_unlink_leaves_resource_tracker_alone():
+    """Regression: unlink() deleted the record queue and each queue producer's
+    segment through SharedMemory.unlink(), which before Python 3.13 also sends
+    the resource tracker an UNREGISTER. slick-queue-py keeps no registration
+    since 2.3.0, so the tracker raised KeyError and printed a traceback from its
+    own process. Routing through SlickQueue.unlink() sends nothing."""
+    from multiprocessing import resource_tracker
+    names = ("mux_py_ut_records", "mux_py_ut_p0", "mux_py_ut_q1")
+    _remove_all(names)
+    mux = StreamBufferMultiplexer(shared_queue_size=64, name=names[0])
+    mux.add_producer(0, capacity=1024, control_size=16, name=names[1])
+    mux.add_queue_producer(1, size=1024, items_per_slot=16, name=names[2])
+    mux.close()
+
+    calls = []
+    original = resource_tracker.unregister
+    resource_tracker.unregister = lambda n, rtype: calls.append((n, rtype))
+    try:
+        mux.unlink()
+    finally:
+        resource_tracker.unregister = original
+    assert calls == [], calls
+
+    if sys.platform != 'win32':
+        leaked = [n for n in names if StreamBufferMultiplexer.remove(n)]
+        assert not leaked, f"segments outlived close() + unlink(): {leaked}"
+
+
+def test_shm_creator_exit_keeps_segments():
+    """A creator's exit used to unlink its names on POSIX through the resource
+    tracker - the record queue and both kinds of producer segment - stranding
+    every consumer still attached. On Windows a section dies with its last
+    handle, which no one else holds here."""
+    if sys.platform == 'win32':
+        return
+    names = ("mux_py_cx_records", "mux_py_cx_p0", "mux_py_cx_q1")
+    _remove_all(names)
+    try:
+        _run_lifetime_child(*names, 'create', "from child")
+        assert _read_all(*names) == [(0, b"from child"), (1, b"from child")]
+
+        # A restarted creator reattaches to all three and keeps their contents
+        again = StreamBufferMultiplexer(shared_queue_size=64, name=names[0])
+        try:
+            assert not again.shared_queue._own
+            pb = again.add_producer(0, capacity=1024, control_size=16, name=names[1])
+            pq = again.add_queue_producer(1, size=1024, items_per_slot=16, name=names[2])
+            assert not pb.own_buffer
+            assert not pq.own_buffer
+        finally:
+            again.close()
+    finally:
+        _remove_all(names)
+
+
+def test_shm_attacher_exit_keeps_segments():
+    """Before Python 3.13 attaching registered every name with the attacher's
+    resource tracker too, so any peer's exit unlinked the segments on POSIX."""
+    names = ("mux_py_ax_records", "mux_py_ax_p0", "mux_py_ax_q1")
+    _remove_all(names)
+    creator = StreamBufferMultiplexer(shared_queue_size=64, name=names[0])
+    try:
+        creator.add_producer(0, capacity=1024, control_size=16, name=names[1])
+        creator.add_queue_producer(1, size=1024, items_per_slot=16, name=names[2])
+        _run_lifetime_child(*names, 'open', "first")
+        _run_lifetime_child(*names, 'open', "second")
+        assert _read_all(*names) == [
+            (0, b"first"), (1, b"first"), (0, b"second"), (1, b"second")]
+    finally:
+        creator.close()
+        creator.unlink()
+
+
 def run_all_tests():
     tests = [
         ("ShmRoundtrip", test_shm_roundtrip),
@@ -536,6 +677,10 @@ def run_all_tests():
         ("ShmQueueCrossProcessRoundtrip", test_shm_queue_cross_process_roundtrip),
         ("ShmUnlinkAfterCloseCoversQueueProducers",
          test_shm_unlink_after_close_covers_queue_producers),
+        ("ShmUnlinkLeavesResourceTrackerAlone",
+         test_shm_unlink_leaves_resource_tracker_alone),
+        ("ShmCreatorExitKeepsSegments", test_shm_creator_exit_keeps_segments),
+        ("ShmAttacherExitKeepsSegments", test_shm_attacher_exit_keeps_segments),
     ]
 
     print("=" * 70)
