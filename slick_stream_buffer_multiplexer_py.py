@@ -85,7 +85,7 @@ Caveats (same as C++):
 """
 from __future__ import annotations
 
-__version__ = '2.2.0'
+__version__ = '2.2.0.post1'
 
 import enum
 import operator
